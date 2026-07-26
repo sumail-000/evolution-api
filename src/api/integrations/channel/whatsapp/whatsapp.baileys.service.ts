@@ -958,7 +958,22 @@ export class BaileysStartupService extends ChannelStartupService {
         }));
 
         if (contactsRaw.length > 0) {
-          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
+          // forward the whole identity: address-book name, self-set name and BOTH jids.
+          // Upstream sends only the stripped row, so a consumer can neither name a
+          // contact properly nor resolve a @lid back to a phone number.
+          this.sendDataWebhook(
+            Events.CONTACTS_UPSERT,
+            (contacts as any[]).map((contact: any) => ({
+              remoteJid: contact?.id,
+              lid: contact?.lid ?? null,
+              phoneNumber: contact?.phoneNumber ?? null,
+              savedName: contact?.name ?? null,
+              notifyName: contact?.notify ?? null,
+              verifiedName: contact?.verifiedName ?? null,
+              pushName: contact?.name || contact?.verifiedName || contact?.notify || null,
+              instanceId: this.instanceId,
+            })),
+          );
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
             await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
@@ -1052,7 +1067,19 @@ export class BaileysStartupService extends ChannelStartupService {
         });
       }
 
-      this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
+      this.sendDataWebhook(
+        Events.CONTACTS_UPDATE,
+        (contacts as any[]).map((contact: any) => ({
+          remoteJid: contact?.id,
+          lid: contact?.lid ?? null,
+          phoneNumber: contact?.phoneNumber ?? null,
+          savedName: contact?.name ?? null,
+          notifyName: contact?.notify ?? null,
+          verifiedName: contact?.verifiedName ?? null,
+          pushName: contact?.name || contact?.verifiedName || contact?.notify || null,
+          instanceId: this.instanceId,
+        })),
+      );
 
       if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
         const updateTransactions = contactsRaw.map((contact) =>
@@ -1215,8 +1242,10 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
+        // pass the contact through whole — mapping it to {id, name} here threw away
+        // `lid` and `phoneNumber`, which is exactly what resolves a privacy id
         await this.contactHandle['contacts.upsert'](
-          contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+          contacts.filter((c) => !!c.notify || !!c.name || !!(c as any).lid || !!(c as any).phoneNumber),
         );
 
         contacts = undefined;
