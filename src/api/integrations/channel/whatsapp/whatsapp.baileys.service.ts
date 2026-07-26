@@ -399,6 +399,42 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * Re-fetch the address book from WhatsApp's app state.
+   *
+   * Baileys 7.0.0-rc delivers `contacts` unreliably on first connect — the
+   * contacts.upsert carrying the name->jid mapping simply never arrives for some
+   * accounts (WhiskeySockets/Baileys#1816, #2077), which leaves every chat showing
+   * a bare number instead of the name you saved. Contact names live in the
+   * `critical_unblock_low` app-state patch, so asking for that patch again replays
+   * them as contacts.upsert.
+   *
+   * Deliberately delayed: doing this the instant the socket opens competes with
+   * WhatsApp's own initial sync and yields FEWER contacts, not more.
+   */
+  public async resyncContacts(reason = 'scheduled'): Promise<boolean> {
+    try {
+      const anyClient = this.client as any;
+      if (!anyClient?.resyncAppState) return false;
+      await anyClient.resyncAppState(['critical_unblock_low'], true);
+      const n = await this.prismaRepository.contact.count({ where: { instanceId: this.instanceId } });
+      this.logger.info(`[resyncContacts] ${reason}: address book resynced, ${n} contacts known`);
+      return true;
+    } catch (e) {
+      this.logger.warn(`[resyncContacts] ${reason} failed: ${(e as any)?.message}`);
+      return false;
+    }
+  }
+
+  /** Give the initial sync room, then top up whatever WhatsApp didn't send. */
+  private scheduleContactResync(): void {
+    for (const delay of [60_000, 240_000]) {
+      setTimeout(() => {
+        void this.resyncContacts(`t+${Math.round(delay / 1000)}s`);
+      }, delay).unref?.();
+    }
+  }
+
   public async syncLidMappings(): Promise<{ queried: number; resolved: number }> {
     const mapping: any = (this.client as any)?.signalRepository?.lidMapping;
     if (!mapping?.getLIDsForPNs) return { queried: 0, resolved: 0 };
@@ -616,6 +652,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // repository, which makes getPNForLID work for contacts that never wrote
       // to us — the same information WhatsApp Web uses to show real numbers.
       this.syncLidMappings().catch((e) => this.logger.error(['syncLidMappings failed', e?.message]));
+      this.scheduleContactResync();
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
         this.chatwootService.eventWhatsapp(
