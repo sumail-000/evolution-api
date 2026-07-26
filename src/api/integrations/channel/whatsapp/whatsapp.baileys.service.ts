@@ -337,6 +337,47 @@ export class BaileysStartupService extends ChannelStartupService {
    * be read back by consumers. Upstream Evolution never calls this, which is why
    * @lid chats can never be traced back to a real number.
    */
+  /**
+   * Persist one lid <-> phone pairing. Baileys hands us both on Contact (`id`,
+   * `lid`, `phoneNumber`); upstream keeps only `id`, which is why @lid chats can
+   * never be traced back to a real number.
+   */
+  private async rememberLidPair(pnJid: string, lidJid: string): Promise<void> {
+    if (!pnJid?.includes('@s.whatsapp.net') || !lidJid?.includes('@lid')) return;
+    const pn = pnJid.replace(/:\d+@/, '@');
+    const lid = lidJid.replace(/:\d+@/, '@');
+    try {
+      const existing = await this.prismaRepository.isOnWhatsapp.findFirst({ where: { remoteJid: pn } });
+      if (existing) {
+        if (existing.lid !== lid) {
+          await this.prismaRepository.isOnWhatsapp.update({ where: { id: existing.id }, data: { lid } });
+        }
+      } else {
+        await this.prismaRepository.isOnWhatsapp.create({
+          data: { remoteJid: pn, jidOptions: [pn, lid].join(','), lid },
+        });
+      }
+    } catch {
+      // non-fatal: a pairing we could not store will be retried on the next sync
+    }
+  }
+
+  /** Harvest lid <-> phone pairings straight off a batch of Baileys contacts. */
+  private async harvestContactLids(contacts: Partial<Contact>[]): Promise<void> {
+    for (const c of contacts ?? []) {
+      const anyC = c as any;
+      const id: string | undefined = anyC?.id;
+      const lid: string | undefined = anyC?.lid;
+      const phone: string | undefined = anyC?.phoneNumber;
+      if (!id) continue;
+      if (id.includes('@lid') && phone?.includes('@s.whatsapp.net')) {
+        await this.rememberLidPair(phone, id);
+      } else if (id.includes('@s.whatsapp.net') && lid?.includes('@lid')) {
+        await this.rememberLidPair(id, lid);
+      }
+    }
+  }
+
   public async syncLidMappings(): Promise<{ queried: number; resolved: number }> {
     const mapping: any = (this.client as any)?.signalRepository?.lidMapping;
     if (!mapping?.getLIDsForPNs) return { queried: 0, resolved: 0 };
@@ -866,9 +907,13 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
+        // keep the lid <-> phone pairing WhatsApp just told us about
+        await this.harvestContactLids(contacts);
+
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
-          pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+          pushName:
+            contact?.name || contact?.verifiedName || (contact.id.includes('@lid') ? null : contact.id.split('@')[0]),
           profilePicUrl: null,
           instanceId: this.instanceId,
         }));
@@ -901,10 +946,13 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
+        await this.harvestContactLids(contacts);
+
         const updatedContacts = await Promise.all(
           contacts.map(async (contact) => ({
             remoteJid: contact.id,
-            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+            pushName:
+              contact?.name || contact?.verifiedName || (contact.id.includes('@lid') ? null : contact.id.split('@')[0]),
             profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
             instanceId: this.instanceId,
           })),
@@ -953,6 +1001,7 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
+      await this.harvestContactLids(contacts);
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
