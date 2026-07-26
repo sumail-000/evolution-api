@@ -2020,6 +2020,16 @@ export class BaileysStartupService extends ChannelStartupService {
               this.connectionUpdate(events['connection.update']);
             }
 
+            // Baileys announces every lid <-> phone pairing it learns (history sync,
+            // message decryption, USync). Upstream ignores this event entirely, which
+            // is the main reason @lid chats can never be traced back to a real number.
+            if (events['lid-mapping.update']) {
+              const m: any = events['lid-mapping.update'];
+              for (const pair of Array.isArray(m) ? m : [m]) {
+                if (pair?.pn && pair?.lid) await this.rememberLidPair(pair.pn, pair.lid);
+              }
+            }
+
             if (events['creds.update']) {
               this.instance.authState.saveCreds();
             }
