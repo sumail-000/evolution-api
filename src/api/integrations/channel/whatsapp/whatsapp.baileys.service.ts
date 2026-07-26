@@ -362,6 +362,27 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * Harvest lid <-> phone pairings from chats. WhatsApp sends every conversation
+   * with BOTH `pnJid` and `lidJid` populated (proto.IConversation); upstream keeps
+   * only `id`, throwing the pairing away for every chat it stores.
+   */
+  private async harvestChatLids(chats: any[]): Promise<void> {
+    for (const chat of chats ?? []) {
+      const pn: string | undefined = chat?.pnJid;
+      const lid: string | undefined = chat?.lidJid;
+      if (pn && lid) {
+        await this.rememberLidPair(pn, lid);
+        continue;
+      }
+      // only one side present -> pair it with the chat id, which holds the other
+      const id: string | undefined = chat?.id;
+      if (!id) continue;
+      if (pn && id.includes('@lid')) await this.rememberLidPair(pn, id);
+      else if (lid && id.includes('@s.whatsapp.net')) await this.rememberLidPair(id, lid);
+    }
+  }
+
   /** Harvest lid <-> phone pairings straight off a batch of Baileys contacts. */
   private async harvestContactLids(contacts: Partial<Contact>[]): Promise<void> {
     for (const c of contacts ?? []) {
@@ -865,6 +886,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
+      await this.harvestChatLids(chats as any[]);
       const existingChatIds = await this.prismaRepository.chat.findMany({
         where: { instanceId: this.instanceId },
         select: { remoteJid: true },
@@ -896,6 +918,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       >[],
     ) => {
+      await this.harvestChatLids(chats as any[]);
       const chatsRaw = chats.map((chat) => {
         return { remoteJid: chat.id, instanceId: this.instanceId };
       });
@@ -1096,6 +1119,8 @@ export class BaileysStartupService extends ChannelStartupService {
             contactsMap.set(contact.id, { name: contact.name ?? contact.notify, jid: contact.id });
           }
         }
+
+        await this.harvestChatLids(chats as any[]);
 
         const chatsRaw: { remoteJid: string; instanceId: string; name?: string }[] = [];
         const chatsRepository = new Set(
