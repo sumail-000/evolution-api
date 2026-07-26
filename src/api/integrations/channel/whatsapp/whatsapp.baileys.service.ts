@@ -382,6 +382,22 @@ export class BaileysStartupService extends ChannelStartupService {
     const mapping: any = (this.client as any)?.signalRepository?.lidMapping;
     if (!mapping?.getLIDsForPNs) return { queried: 0, resolved: 0 };
 
+    // Ask WhatsApp to resend app state. It replays the contact/chat directory,
+    // which makes Baileys re-emit lid-mapping.update for pairings it already
+    // knows — the only way to recover mappings for chats synced earlier.
+    try {
+      const anyClient = this.client as any;
+      if (anyClient?.resyncAppState) {
+        await anyClient.resyncAppState(
+          ['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'],
+          true,
+        );
+        this.logger.info('[syncLidMappings] app state resynced');
+      }
+    } catch (e) {
+      this.logger.verbose(`[syncLidMappings] app-state resync skipped: ${(e as any)?.message}`);
+    }
+
     const contacts = await this.prismaRepository.contact.findMany({
       where: { instanceId: this.instanceId, remoteJid: { endsWith: '@s.whatsapp.net' } },
       select: { remoteJid: true },
