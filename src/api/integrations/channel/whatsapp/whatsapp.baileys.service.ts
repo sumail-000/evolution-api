@@ -331,6 +331,58 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
+  /**
+   * Ask WhatsApp (via Baileys' USync lid-mapping) for the privacy id behind every
+   * phone number we know, and persist the pairing so it survives restarts and can
+   * be read back by consumers. Upstream Evolution never calls this, which is why
+   * @lid chats can never be traced back to a real number.
+   */
+  public async syncLidMappings(): Promise<{ queried: number; resolved: number }> {
+    const mapping: any = (this.client as any)?.signalRepository?.lidMapping;
+    if (!mapping?.getLIDsForPNs) return { queried: 0, resolved: 0 };
+
+    const contacts = await this.prismaRepository.contact.findMany({
+      where: { instanceId: this.instanceId, remoteJid: { endsWith: '@s.whatsapp.net' } },
+      select: { remoteJid: true },
+    });
+    const pns = [...new Set(contacts.map((c) => c.remoteJid))];
+    if (!pns.length) return { queried: 0, resolved: 0 };
+
+    let resolved = 0;
+    // batched — USync is a network round trip per chunk
+    for (let i = 0; i < pns.length; i += 50) {
+      const chunk = pns.slice(i, i + 50);
+      try {
+        const pairs = await mapping.getLIDsForPNs(chunk);
+        for (const pair of pairs ?? []) {
+          const pn = pair?.pn;
+          const lid = pair?.lid;
+          if (!pn || !lid || !String(lid).includes('@lid')) continue;
+          const bareLid = String(lid).replace(/:\d+@/, '@');
+          try {
+            const existing = await this.prismaRepository.isOnWhatsapp.findFirst({ where: { remoteJid: pn } });
+            if (existing) {
+              if (existing.lid !== bareLid) {
+                await this.prismaRepository.isOnWhatsapp.update({ where: { id: existing.id }, data: { lid: bareLid } });
+              }
+            } else {
+              await this.prismaRepository.isOnWhatsapp.create({
+                data: { remoteJid: pn, jidOptions: [pn, bareLid].join(','), lid: bareLid },
+              });
+            }
+            resolved++;
+          } catch {
+            this.logger.verbose(`[syncLidMappings] could not persist ${pn} -> ${bareLid}`);
+          }
+        }
+      } catch (e) {
+        this.logger.error(['syncLidMappings chunk failed', (e as any)?.message]);
+      }
+    }
+    this.logger.info(`[syncLidMappings] queried ${pns.length} numbers, stored ${resolved} lid pairings`);
+    return { queried: pns.length, resolved };
+  }
+
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
@@ -496,6 +548,12 @@ export class BaileysStartupService extends ChannelStartupService {
           connectionStatus: 'open',
         },
       });
+
+      // Resolve WhatsApp privacy ids (@lid) for every contact we know about.
+      // Baileys asks WhatsApp over USync and stores the pairs in its signal
+      // repository, which makes getPNForLID work for contacts that never wrote
+      // to us — the same information WhatsApp Web uses to show real numbers.
+      this.syncLidMappings().catch((e) => this.logger.error(['syncLidMappings failed', e?.message]));
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
         this.chatwootService.eventWhatsapp(
@@ -1475,6 +1533,16 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
+          if (messageRaw.key.remoteJid?.includes('@lid') && !messageRaw.key.remoteJidAlt) {
+            try {
+              const pn = await (this.client as any)?.signalRepository?.lidMapping?.getPNForLID(
+                messageRaw.key.remoteJid,
+              );
+              if (pn) messageRaw.key.remoteJidAlt = String(pn).replace(/:\d+@/, '@');
+            } catch {
+              // mapping not known yet — leave the key as it arrived
+            }
+          }
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
           }
