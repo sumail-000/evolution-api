@@ -91,9 +91,13 @@ async function bootstrap() {
 
   app.use('/store', express.static(join(ROOT_DIR, 'store')));
 
-  // Licensing — public routes (always work) and gate middleware (blocks rest).
+  // Licensing — public routes stay mounted so a key CAN be activated later, but
+  // the gate is opt-in on this self-hosted fork (Apache-2.0 modification, owner
+  // approved): a 503 on every business route would take the WhatsApp line down.
   app.use('/license', buildLicenseRouter(licensingRC));
-  app.use(gateMiddleware(licensingRC));
+  if (process.env.LICENSE_GATE_ENABLED === 'true') {
+    app.use(gateMiddleware(licensingRC));
+  }
 
   app.use('/', router);
 
@@ -184,8 +188,11 @@ async function bootstrap() {
 
   server.listen(httpServer.PORT, () => logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + httpServer.PORT));
 
-  // Start licensing heartbeat (30 min) — fire-and-forget.
-  startHeartbeat(licensingRC, startedAt);
+  // Start licensing heartbeat (30 min) — only when the gate is in use; a
+  // self-hosted line should not depend on (or report to) an external server.
+  if (process.env.LICENSE_GATE_ENABLED === 'true') {
+    startHeartbeat(licensingRC, startedAt);
+  }
 
   // Notify the licensing server about graceful shutdown.
   const onSignal = async () => {

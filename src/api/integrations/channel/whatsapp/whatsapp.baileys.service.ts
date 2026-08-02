@@ -388,6 +388,155 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
+  /**
+   * Persist one lid <-> phone pairing. Baileys hands us both on Contact (`id`,
+   * `lid`, `phoneNumber`); upstream keeps only `id`, which is why @lid chats can
+   * never be traced back to a real number.
+   */
+  private async rememberLidPair(pnJid: string, lidJid: string): Promise<void> {
+    if (!pnJid?.includes('@s.whatsapp.net') || !lidJid?.includes('@lid')) return;
+    const pn = pnJid.replace(/:\d+@/, '@');
+    const lid = lidJid.replace(/:\d+@/, '@');
+    try {
+      const existing = await this.prismaRepository.isOnWhatsapp.findFirst({ where: { remoteJid: pn } });
+      if (existing) {
+        if (existing.lid !== lid) {
+          await this.prismaRepository.isOnWhatsapp.update({ where: { id: existing.id }, data: { lid } });
+        }
+      } else {
+        await this.prismaRepository.isOnWhatsapp.create({
+          data: { remoteJid: pn, jidOptions: [pn, lid].join(','), lid },
+        });
+      }
+    } catch {
+      // non-fatal: a pairing we could not store will be retried on the next sync
+    }
+  }
+
+  /**
+   * Harvest lid <-> phone pairings from chats. WhatsApp sends every conversation
+   * with BOTH `pnJid` and `lidJid` populated (proto.IConversation); upstream keeps
+   * only `id`, throwing the pairing away for every chat it stores.
+   */
+  private async harvestChatLids(chats: any[]): Promise<void> {
+    for (const chat of chats ?? []) {
+      const pn: string | undefined = chat?.pnJid;
+      const lid: string | undefined = chat?.lidJid;
+      if (pn && lid) {
+        await this.rememberLidPair(pn, lid);
+        continue;
+      }
+      // only one side present -> pair it with the chat id, which holds the other
+      const id: string | undefined = chat?.id;
+      if (!id) continue;
+      if (pn && id.includes('@lid')) await this.rememberLidPair(pn, id);
+      else if (lid && id.includes('@s.whatsapp.net')) await this.rememberLidPair(id, lid);
+    }
+  }
+
+  /** Harvest lid <-> phone pairings straight off a batch of Baileys contacts. */
+  private async harvestContactLids(contacts: Partial<Contact>[]): Promise<void> {
+    for (const c of contacts ?? []) {
+      const anyC = c as any;
+      const id: string | undefined = anyC?.id;
+      const lid: string | undefined = anyC?.lid;
+      const phone: string | undefined = anyC?.phoneNumber;
+      if (!id) continue;
+      if (id.includes('@lid') && phone?.includes('@s.whatsapp.net')) {
+        await this.rememberLidPair(phone, id);
+      } else if (id.includes('@s.whatsapp.net') && lid?.includes('@lid')) {
+        await this.rememberLidPair(id, lid);
+      }
+    }
+  }
+
+  /**
+   * Re-fetch the address book from WhatsApp's app state.
+   *
+   * Baileys 7.0.0-rc delivers `contacts` unreliably on first connect — the
+   * contacts.upsert carrying the name->jid mapping simply never arrives for some
+   * accounts (WhiskeySockets/Baileys#1816, #2077), which leaves every chat showing
+   * a bare number instead of the name you saved. Contact names live in the
+   * `critical_unblock_low` app-state patch, so asking for that patch again replays
+   * them as contacts.upsert.
+   *
+   * Deliberately delayed: doing this the instant the socket opens competes with
+   * WhatsApp's own initial sync and yields FEWER contacts, not more.
+   */
+  public async resyncContacts(reason = 'scheduled'): Promise<boolean> {
+    try {
+      const anyClient = this.client as any;
+      if (!anyClient?.resyncAppState) return false;
+      await anyClient.resyncAppState(['critical_unblock_low'], true);
+      const n = await this.prismaRepository.contact.count({ where: { instanceId: this.instanceId } });
+      this.logger.info(`[resyncContacts] ${reason}: address book resynced, ${n} contacts known`);
+      return true;
+    } catch (e) {
+      this.logger.warn(`[resyncContacts] ${reason} failed: ${(e as any)?.message}`);
+      return false;
+    }
+  }
+
+  /** Give the initial sync room, then top up whatever WhatsApp didn't send. */
+  private scheduleContactResync(): void {
+    for (const delay of [60_000, 240_000]) {
+      setTimeout(() => {
+        void this.resyncContacts(`t+${Math.round(delay / 1000)}s`);
+      }, delay).unref?.();
+    }
+  }
+
+  /**
+   * Ask WhatsApp (via Baileys' USync lid-mapping) for the privacy id behind every
+   * phone number we know, and persist the pairing so it survives restarts and can
+   * be read back by consumers.
+   */
+  public async syncLidMappings(): Promise<{ queried: number; resolved: number }> {
+    const mapping: any = (this.client as any)?.signalRepository?.lidMapping;
+    if (!mapping?.getLIDsForPNs) return { queried: 0, resolved: 0 };
+
+    const contacts = await this.prismaRepository.contact.findMany({
+      where: { instanceId: this.instanceId, remoteJid: { endsWith: '@s.whatsapp.net' } },
+      select: { remoteJid: true },
+    });
+    const pns = [...new Set(contacts.map((c) => c.remoteJid))];
+    if (!pns.length) return { queried: 0, resolved: 0 };
+
+    let resolved = 0;
+    // batched — USync is a network round trip per chunk
+    for (let i = 0; i < pns.length; i += 50) {
+      const chunk = pns.slice(i, i + 50);
+      try {
+        const pairs = await mapping.getLIDsForPNs(chunk);
+        for (const pair of pairs ?? []) {
+          const pn = pair?.pn;
+          const lid = pair?.lid;
+          if (!pn || !lid || !String(lid).includes('@lid')) continue;
+          const bareLid = String(lid).replace(/:\d+@/, '@');
+          try {
+            const existing = await this.prismaRepository.isOnWhatsapp.findFirst({ where: { remoteJid: pn } });
+            if (existing) {
+              if (existing.lid !== bareLid) {
+                await this.prismaRepository.isOnWhatsapp.update({ where: { id: existing.id }, data: { lid: bareLid } });
+              }
+            } else {
+              await this.prismaRepository.isOnWhatsapp.create({
+                data: { remoteJid: pn, jidOptions: [pn, bareLid].join(','), lid: bareLid },
+              });
+            }
+            resolved++;
+          } catch {
+            this.logger.verbose(`[syncLidMappings] could not persist ${pn} -> ${bareLid}`);
+          }
+        }
+      } catch (e) {
+        this.logger.error(['syncLidMappings chunk failed', (e as any)?.message]);
+      }
+    }
+    this.logger.info(`[syncLidMappings] queried ${pns.length} numbers, stored ${resolved} lid pairings`);
+    return { queried: pns.length, resolved };
+  }
+
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
     // Enhanced logging for connection updates
     const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
@@ -605,6 +754,13 @@ export class BaileysStartupService extends ChannelStartupService {
           connectionStatus: 'open',
         },
       });
+
+      // Resolve WhatsApp privacy ids (@lid) for every contact we know about.
+      // Baileys asks WhatsApp over USync and stores the pairs in its signal
+      // repository, which makes getPNForLID work for contacts that never wrote
+      // to us — the same information WhatsApp Web uses to show real numbers.
+      this.syncLidMappings().catch((e) => this.logger.error(['syncLidMappings failed', e?.message]));
+      this.scheduleContactResync();
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
         this.chatwootService.eventWhatsapp(
@@ -866,6 +1022,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
+      await this.harvestChatLids(chats as any[]);
       const existingChatIds = await this.prismaRepository.chat.findMany({
         where: { instanceId: this.instanceId },
         select: { remoteJid: true },
@@ -897,6 +1054,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       >[],
     ) => {
+      await this.harvestChatLids(chats as any[]);
       const chatsRaw = chats.map((chat) => {
         return { remoteJid: chat.id, instanceId: this.instanceId };
       });
@@ -924,15 +1082,37 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
+        // keep the lid <-> phone pairing WhatsApp just told us about
+        await this.harvestContactLids(contacts);
+
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
-          pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+          pushName:
+            contact?.name ||
+            contact?.verifiedName ||
+            (contact as any)?.notify ||
+            (contact.id.includes('@lid') ? null : contact.id.split('@')[0]),
           profilePicUrl: null,
           instanceId: this.instanceId,
         }));
 
         if (contactsRaw.length > 0) {
-          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
+          // forward the whole identity: address-book name, self-set name and BOTH jids.
+          // Upstream sends only the stripped row, so a consumer can neither name a
+          // contact properly nor resolve a @lid back to a phone number.
+          this.sendDataWebhook(
+            Events.CONTACTS_UPSERT,
+            (contacts as any[]).map((contact: any) => ({
+              remoteJid: contact?.id,
+              lid: contact?.lid ?? null,
+              phoneNumber: contact?.phoneNumber ?? null,
+              savedName: contact?.name ?? null,
+              notifyName: contact?.notify ?? null,
+              verifiedName: contact?.verifiedName ?? null,
+              pushName: contact?.name || contact?.verifiedName || contact?.notify || null,
+              instanceId: this.instanceId,
+            })),
+          );
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
             await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
@@ -1011,6 +1191,7 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
+      await this.harvestContactLids(contacts);
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
@@ -1022,7 +1203,19 @@ export class BaileysStartupService extends ChannelStartupService {
         });
       }
 
-      this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
+      this.sendDataWebhook(
+        Events.CONTACTS_UPDATE,
+        (contacts as any[]).map((contact: any) => ({
+          remoteJid: contact?.id,
+          lid: contact?.lid ?? null,
+          phoneNumber: contact?.phoneNumber ?? null,
+          savedName: contact?.name ?? null,
+          notifyName: contact?.notify ?? null,
+          verifiedName: contact?.verifiedName ?? null,
+          pushName: contact?.name || contact?.verifiedName || contact?.notify || null,
+          instanceId: this.instanceId,
+        })),
+      );
 
       if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
         const updateTransactions = contactsRaw.map((contact) =>
@@ -1091,6 +1284,9 @@ export class BaileysStartupService extends ChannelStartupService {
             return;
           }
         }
+
+        // history chats carry pnJid/lidJid pairings WhatsApp never repeats — keep them
+        await this.harvestChatLids(chats as any[]);
 
         const contactsMap = new Map();
         const contactsMapLidJid = new Map();
@@ -1255,8 +1451,10 @@ export class BaileysStartupService extends ChannelStartupService {
           this.historySyncLastProgress = -1;
         }
 
+        // pass the contact through whole — mapping it to {id, name} here threw away
+        // `lid` and `phoneNumber`, which is exactly what resolves a privacy id
         await this.contactHandle['contacts.upsert'](
-          filteredContacts.map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+          contacts.filter((c) => !!c.notify || !!c.name || !!(c as any).lid || !!(c as any).phoneNumber),
         );
 
         contacts = undefined;
@@ -1665,6 +1863,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
 
+          // remoteJidAlt missing? Baileys' own lid store may still know the number
+          if (messageRaw.key.remoteJid?.includes('@lid') && !messageRaw.key.remoteJidAlt) {
+            try {
+              const pn = await (this.client as any)?.signalRepository?.lidMapping?.getPNForLID(
+                messageRaw.key.remoteJid,
+              );
+              if (pn) messageRaw.key.remoteJidAlt = String(pn).replace(/:\d+@/, '@');
+            } catch {
+              // mapping not known yet — leave the key as it arrived
+            }
+          }
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
             const lid = messageRaw.key.remoteJid;
 
@@ -2135,6 +2344,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['connection.update']) {
               this.connectionUpdate(events['connection.update']);
+            }
+
+            // Baileys announces every lid <-> phone pairing it learns (history sync,
+            // message decryption, USync). Upstream ignores this event entirely, which
+            // is the main reason @lid chats can never be traced back to a real number.
+            if (events['lid-mapping.update']) {
+              const m: any = events['lid-mapping.update'];
+              for (const pair of Array.isArray(m) ? m : [m]) {
+                if (pair?.pn && pair?.lid) await this.rememberLidPair(pair.pn, pair.lid);
+              }
             }
 
             if (events['creds.update']) {

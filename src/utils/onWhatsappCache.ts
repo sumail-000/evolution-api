@@ -127,7 +127,9 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
       // Ordena os JIDs para garantir consistência na string final
       const sortedJidOptions = [...finalJidOptions].sort();
       const newJidOptionsString = sortedJidOptions.join(',');
-      const newLid = item.lid === 'lid' || item.remoteJid?.includes('@lid') ? 'lid' : null;
+      // keep a real resolved LID (see syncLidMappings) instead of the plain marker
+      const existingRealLid = existingRecord?.lid && existingRecord.lid.includes('@lid') ? existingRecord.lid : null;
+      const newLid = existingRealLid ?? (item.lid === 'lid' || item.remoteJid?.includes('@lid') ? 'lid' : null);
 
       const dataPayload = {
         remoteJid: remoteJid,
