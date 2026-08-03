@@ -761,6 +761,13 @@ export class BaileysStartupService extends ChannelStartupService {
           profileName: (await this.getProfileName()) as string,
           profilePicUrl: this.instance.profilePictureUrl,
           connectionStatus: 'open',
+          // Clear the last disconnect: these fields outlive the event that set
+          // them, so a row that has just come back up still reads "401 logged
+          // out" to anyone consulting it. That made a freshly linked line show
+          // "needs re-scan" while the phone showed it connected.
+          disconnectionAt: null,
+          disconnectionReasonCode: null,
+          disconnectionObject: null,
         },
       });
 
