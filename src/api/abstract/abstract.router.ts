@@ -17,11 +17,14 @@ const logger = new Logger('Validate');
 
 const PROTECTED_INSTANCE_FIELDS = ['instanceName', 'instanceId'] as const;
 
-function sanitizeUntrustedInput(source: Record<string, any> | undefined): Record<string, any> {
+function sanitizeUntrustedInput(
+  source: Record<string, any> | undefined,
+  allow: readonly string[] = [],
+): Record<string, any> {
   if (!source || typeof source !== 'object') return {};
   const sanitized: Record<string, any> = {};
   for (const [key, value] of Object.entries(source)) {
-    if ((PROTECTED_INSTANCE_FIELDS as readonly string[]).includes(key)) {
+    if (!allow.includes(key) && (PROTECTED_INSTANCE_FIELDS as readonly string[]).includes(key)) {
       logger.warn(`Ignoring attempt to override protected field "${key}" via untrusted input`);
       continue;
     }
@@ -51,7 +54,12 @@ export abstract class RouterBroker {
     }
 
     if (request.originalUrl.includes('/instance/create')) {
-      Object.assign(instance, sanitizeUntrustedInput(body));
+      // POST /instance/create carries no :instanceName route param, so the body
+      // is the ONLY source for the name — it has to survive the protected-field
+      // filter here. Without this the instance is created with `name: undefined`,
+      // saveInstance swallows the Prisma error, and the caller gets a baffling
+      // `Setting_instanceId_fkey` violation instead. instanceId stays protected.
+      Object.assign(instance, sanitizeUntrustedInput(body, ['instanceName']));
     }
 
     Object.assign(ref, body);
