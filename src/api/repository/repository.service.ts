@@ -17,8 +17,18 @@ function createPrismaAdapter(connectionString: string) {
   if (provider === 'mysql') {
     return new PrismaMariaDb(connectionString);
   }
-  // postgresql e psql_bouncer usam o adapter do Postgres
-  return new PrismaPg(connectionString);
+  // postgresql e psql_bouncer usam o adapter do Postgres.
+  // O driver pg IGNORA o parâmetro ?schema= do Prisma — o migrate respeita e
+  // aplica em evolution_api, mas o runtime cairia em public e nenhuma tabela
+  // seria encontrada ("RuntimeConfig table was not found"). Extrai o schema da
+  // URI e entrega ao adapter, que o usa nas queries geradas.
+  let schema: string | undefined;
+  try {
+    schema = new URL(connectionString).searchParams.get('schema') ?? undefined;
+  } catch {
+    // URI fora do formato URL — segue sem schema explícito
+  }
+  return new PrismaPg(connectionString, schema ? { schema } : undefined);
 }
 
 export class PrismaRepository extends PrismaClient {
