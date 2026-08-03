@@ -654,8 +654,17 @@ export class BaileysStartupService extends ChannelStartupService {
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408];
 
       // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
-      // This prevents infinite loop that blocks QR code generation
-      const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
+      // This prevents infinite loop that blocks QR code generation.
+      //
+      // But a loggedOut (401) is NEVER an initial connection: a never-paired
+      // instance is offered a QR, it is not logged out. A 401 here means stored
+      // creds were rejected, so fall through to the cleanup below — it marks the
+      // instance closed and drops the dead session, which is what lets a fresh QR
+      // be issued. Without this exception the engine idles forever: no reconnect,
+      // no QR, and a stale `open` left in the database, so every consumer believes
+      // the line is live while every send fails with "Connection Closed".
+      const isInitialConnection =
+        statusCode !== DisconnectReason.loggedOut && !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
 
       if (isInitialConnection) {
         this.logger.info('Initial connection closed, waiting for QR code generation...');
